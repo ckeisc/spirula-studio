@@ -128,6 +128,8 @@ add_library(csrc STATIC ${SPLAT_SOURCES})
 
 target_include_directories(csrc PRIVATE
     ${SS_SRC}
+    ${SS_SRC}/external/libwebp      # libwebp "src/..."-prefixed includes
+    ${SS_SRC}/external/libwebp/src  # sharpyuv "webp/..."-style includes
     ${CMAKE_BINARY_DIR}      # app_generated/viewer_html.h
     ${CUDAToolkit_INCLUDE_DIRS}
 )
