@@ -386,17 +386,18 @@ void engine_save_checkpoint(
         }
         try {
             const char* v = spirula::env("SPZ_VERSION");
-            const bool v4 = v && v[0] == '4' && v[1] == '\0';
-            if (v && !v4 && !(v[0] == '3' && v[1] == '\0'))
+            const bool v3 = v && v[0] == '3' && v[1] == '\0';
+            if (v && !v3 && !(v[0] == '4' && v[1] == '\0'))
                 fprintf(stderr,
                         "[checkpoint] warning: SS_SPZ_VERSION=%s not 3 or 4; "
-                        "writing v3\n",
+                        "writing v4\n",
                         v);
-            if (v4)
+            if (v3)
+                spirula::write_splat_spz(xs,
+                                         (out_root / "splat.spz").string());
+            else
                 spirula::write_splat_spz_v4(xs,
                                             (out_root / "splat.spz").string());
-            else
-                spirula::write_splat_spz(xs, (out_root / "splat.spz").string());
         } catch (const std::exception& e) {
             fprintf(stderr, "[checkpoint] SPZ export failed: %s\n", e.what());
         }
