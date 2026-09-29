@@ -16,6 +16,7 @@
 #include "checkpoint/SplatPly.h"
 #include "checkpoint/SplatExport.h"
 #include "core/CheckpointIO.h"
+#include "core/Env.h"
 #include "external/npy.hpp"
 #include <cmath>
 #include <cstdint>
@@ -362,7 +363,7 @@ void engine_save_checkpoint(
         flush();
     }
 
-    // --- SPZ/RAD exports (non-fatal; PLY + state.tar are the checkpoint) ---
+    // --- SPZ/RAD/SOG exports (non-fatal; PLY + state.tar are the checkpoint) ---
     {
         std::vector<int64_t> emap;
         emap.reserve((size_t)kept);
@@ -373,7 +374,7 @@ void engine_save_checkpoint(
         else if (K >= 8) deg = 2;
         else if (K >= 3) deg = 1;
         if (K > 15)
-            fprintf(stderr, "[checkpoint] truncating SH degree 4 to 3 for SPZ/RAD\n");
+            fprintf(stderr, "[checkpoint] truncating SH degree 4 to 3 for SPZ/RAD/SOG\n");
         spirula::SplatExportSource xs;
         xs.num = kept;
         xs.sh_degree = deg;
@@ -394,7 +395,18 @@ void engine_save_checkpoint(
             }
         }
         try {
-            spirula::write_splat_spz(xs, (out_root / "splat.spz").string());
+            const char* v = spirula::env("SPZ_VERSION");
+            const bool v4 = v && v[0] == '4' && v[1] == '\0';
+            if (v && !v4 && !(v[0] == '3' && v[1] == '\0'))
+                fprintf(stderr,
+                        "[checkpoint] warning: SS_SPZ_VERSION=%s not 3 or 4; "
+                        "writing v3\n",
+                        v);
+            if (v4)
+                spirula::write_splat_spz_v4(xs,
+                                            (out_root / "splat.spz").string());
+            else
+                spirula::write_splat_spz(xs, (out_root / "splat.spz").string());
         } catch (const std::exception& e) {
             fprintf(stderr, "[checkpoint] SPZ export failed: %s\n", e.what());
         }
@@ -402,6 +414,11 @@ void engine_save_checkpoint(
             spirula::write_splat_rad(xs, (out_root / "splat.rad").string());
         } catch (const std::exception& e) {
             fprintf(stderr, "[checkpoint] RAD export failed: %s\n", e.what());
+        }
+        try {
+            spirula::write_splat_sog(xs, (out_root / "splat.sog").string());
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[checkpoint] SOG export failed: %s\n", e.what());
         }
     }
 

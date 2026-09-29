@@ -3,17 +3,22 @@
 #include "checkpoint/SplatExport.h"
 
 #include "external/miniz.h"
+#include "external/zstd.h"
+#include "webp/encode.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -259,9 +264,8 @@ float quantile(std::vector<float>& v, double q) {
     return v[k];
 }
 
-// SPZ v3 (legacy gzip single-stream). v3 is chosen over v4 because it needs
-// no zstd dependency. Coordinates are written as-is, matching the official
-// saveSpz default (no coordinate-system conversion).
+// SPZ packing, shared by the v3 and v4 writers. Coordinates are written
+// as-is, matching the official saveSpz default (no coordinate conversion).
 constexpr float kSpzColorScale = 0.15f;
 constexpr float kSpzSqrtHalf = 0.707106781186547524401f;
 
@@ -303,15 +307,77 @@ void spz_push_u32le(std::vector<uint8_t>& v, uint32_t x) {
     for (int i = 0; i < 4; ++i) v.push_back((uint8_t)(x >> (8 * i)));
 }
 
+void spz_push_u64le(std::vector<uint8_t>& v, uint64_t x) {
+    for (int i = 0; i < 8; ++i) v.push_back((uint8_t)(x >> (8 * i)));
+}
+
+// Attribute streams in official order: positions, alphas, colors, scales,
+// rotations, sh.
+struct SpzStreams {
+    std::vector<uint8_t> positions, alphas, colors, scales, rotations, sh;
+};
+
+void spz_pack_streams(const SplatExportSource& s, SpzStreams& st) {
+    const int64_t n = s.num;
+    const int sh_dim = sh_k(s.sh_degree);
+    st.positions.reserve((size_t)n * 9);
+    st.alphas.reserve((size_t)n);
+    st.colors.reserve((size_t)n * 3);
+    st.scales.reserve((size_t)n * 3);
+    st.rotations.reserve((size_t)n * 4);
+    st.sh.reserve((size_t)n * (size_t)sh_dim * 3);
+    for (int64_t k = 0; k < n; ++k) {  // positions: 24-bit fixed point
+        const int64_t i = src_row(s, k);
+        for (int j = 0; j < 3; ++j) {
+            const int32_t f =
+                (int32_t)std::lround(s.means[i * 3 + j] * 4096.0f);
+            const uint32_t u = (uint32_t)f;
+            st.positions.push_back((uint8_t)(u & 0xff));
+            st.positions.push_back((uint8_t)((u >> 8) & 0xff));
+            st.positions.push_back((uint8_t)((u >> 16) & 0xff));
+        }
+    }
+    for (int64_t k = 0; k < n; ++k)  // alphas
+        st.alphas.push_back(
+            u8_sat(std::round(sigmoidf(s.opacities[src_row(s, k)]) * 255.0f)));
+    for (int64_t k = 0; k < n; ++k) {  // colors (DC)
+        const int64_t i = src_row(s, k);
+        for (int j = 0; j < 3; ++j)
+            st.colors.push_back(u8_sat(std::round(s.features_dc[i * 3 + j] *
+                                                      kSpzColorScale * 255.0f +
+                                                  127.5f)));
+    }
+    for (int64_t k = 0; k < n; ++k) {  // scales
+        const int64_t i = src_row(s, k);
+        for (int j = 0; j < 3; ++j)
+            st.scales.push_back(
+                u8_sat(std::round((s.scales[i * 3 + j] + 10.0f) * 16.0f)));
+    }
+    for (int64_t k = 0; k < n; ++k) {  // rotations
+        uint8_t r[4];
+        spz_pack_quat(s.quats + src_row(s, k) * 4, r);
+        st.rotations.insert(st.rotations.end(), r, r + 4);
+    }
+    for (int64_t k = 0; k < n; ++k)  // sh: coefficient outer, channel inner
+        for (int c = 0; c < sh_dim; ++c) {
+            const int bucket = c < 3 ? 8 : 16;  // 5 bits deg-1, 4 bits rest
+            for (int j = 0; j < 3; ++j)
+                st.sh.push_back(
+                    spz_quant_sh(src_sh(s, src_row(s, k), c, j), bucket));
+        }
+}
+
 }  // namespace
 
 void write_splat_spz(const SplatExportSource& s, const std::string& path) {
     check_source(s, "write_splat_spz");
     const int64_t n = s.num;
     const int sh_dim = sh_k(s.sh_degree);
+    SpzStreams st;
+    spz_pack_streams(s, st);
 
     std::vector<uint8_t> raw;
-    raw.reserve((size_t)n * (9 + 1 + 3 + 3 + 4 + sh_dim * 3) + 16);
+    raw.reserve(16 + (size_t)n * (9 + 1 + 3 + 3 + 4 + sh_dim * 3));
     raw.push_back('N');
     raw.push_back('G');
     raw.push_back('S');
@@ -322,55 +388,713 @@ void write_splat_spz(const SplatExportSource& s, const std::string& path) {
     raw.push_back(12);  // fractionalBits
     raw.push_back(0);   // flags (not trained with antialiasing)
     raw.push_back(0);   // reserved
-
-    for (int64_t k = 0; k < n; ++k) {  // positions: 24-bit fixed point
-        const int64_t i = src_row(s, k);
-        for (int j = 0; j < 3; ++j) {
-            const int32_t f = (int32_t)std::lround(s.means[i * 3 + j] * 4096.0f);
-            const uint32_t u = (uint32_t)f;
-            raw.push_back((uint8_t)(u & 0xff));
-            raw.push_back((uint8_t)((u >> 8) & 0xff));
-            raw.push_back((uint8_t)((u >> 16) & 0xff));
-        }
-    }
-    for (int64_t k = 0; k < n; ++k)  // alphas
-        raw.push_back(u8_sat(std::round(sigmoidf(s.opacities[src_row(s, k)]) * 255.0f)));
-    for (int64_t k = 0; k < n; ++k) {  // colors (DC)
-        const int64_t i = src_row(s, k);
-        for (int j = 0; j < 3; ++j)
-            raw.push_back(u8_sat(std::round(s.features_dc[i * 3 + j] *
-                                                kSpzColorScale * 255.0f +
-                                            127.5f)));
-    }
-    for (int64_t k = 0; k < n; ++k) {  // scales
-        const int64_t i = src_row(s, k);
-        for (int j = 0; j < 3; ++j)
-            raw.push_back(u8_sat(std::round((s.scales[i * 3 + j] + 10.0f) * 16.0f)));
-    }
-    for (int64_t k = 0; k < n; ++k) {  // rotations
-        uint8_t r[4];
-        spz_pack_quat(s.quats + src_row(s, k) * 4, r);
-        raw.insert(raw.end(), r, r + 4);
-    }
-    for (int64_t k = 0; k < n; ++k)  // sh: coefficient outer, channel inner
-        for (int c = 0; c < sh_dim; ++c) {
-            const int bucket = c < 3 ? 8 : 16;  // 5 bits deg-1, 4 bits rest
-            for (int j = 0; j < 3; ++j)
-                raw.push_back(
-                    spz_quant_sh(src_sh(s, src_row(s, k), c, j), bucket));
-        }
+    const std::vector<uint8_t>* streams[6] = {
+        &st.positions, &st.alphas, &st.colors,
+        &st.scales, &st.rotations, &st.sh,
+    };
+    for (const auto* v : streams) raw.insert(raw.end(), v->begin(), v->end());
 
     std::vector<uint8_t> gz;
     gzip_compress(raw.data(), raw.size(), gz);
     write_file_bytes(path, gz);
 }
 
-void write_splat_sog(const SplatExportSource& s, const std::string& path) {
-    (void)s;
-    (void)path;
-    throw std::runtime_error(
-        "SOG export requires a native lossless WebP encoder (not yet implemented). "
-        "SPZ and RAD exports are available.");
+// SPZ v4: 32-byte plaintext header, TOC, independent zstd streams.
+void write_splat_spz_v4(const SplatExportSource& s, const std::string& path) {
+    check_source(s, "write_splat_spz_v4");
+    const int64_t n = s.num;
+    SpzStreams st;
+    spz_pack_streams(s, st);
+    const std::vector<uint8_t>* streams[6] = {
+        &st.positions, &st.alphas, &st.colors,
+        &st.scales, &st.rotations, &st.sh,
+    };
+
+    std::vector<std::vector<uint8_t>> comp;
+    std::vector<size_t> usize;
+    for (int i = 0; i < 6; ++i) {
+        if (streams[i]->empty()) continue;  // official writer skips these
+        const size_t bound = ZSTD_compressBound(streams[i]->size());
+        std::vector<uint8_t> c(bound);
+        const size_t cn =
+            ZSTD_compress(c.data(), bound, streams[i]->data(),
+                          streams[i]->size(), 3);
+        if (ZSTD_isError(cn))
+            throw std::runtime_error(std::string("zstd compress failed: ") +
+                                     ZSTD_getErrorName(cn));
+        c.resize(cn);
+        comp.push_back(std::move(c));
+        usize.push_back(streams[i]->size());
+    }
+    const int nstreams = (int)comp.size();
+
+    std::vector<uint8_t> out;
+    out.reserve(32 + (size_t)nstreams * 16);
+    out.push_back('N');
+    out.push_back('G');
+    out.push_back('S');
+    out.push_back('P');
+    spz_push_u32le(out, 4);            // version
+    spz_push_u32le(out, (uint32_t)n);  // numPoints
+    out.push_back((uint8_t)s.sh_degree);
+    out.push_back(12);  // fractionalBits
+    out.push_back(0);   // flags (not trained with antialiasing)
+    out.push_back((uint8_t)nstreams);  // numStreams (empty ones skipped)
+    spz_push_u32le(out, 32);  // tocByteOffset (no extensions)
+    out.insert(out.end(), 12, 0);  // reserved
+    for (int i = 0; i < nstreams; ++i) {  // TOC: (compressed, uncompressed)
+        spz_push_u64le(out, comp[i].size());
+        spz_push_u64le(out, usize[i]);
+    }
+    for (int i = 0; i < nstreams; ++i)
+        out.insert(out.end(), comp[i].begin(), comp[i].end());
+    write_file_bytes(path, out);
+}
+
+// ---- SOG v2 (PlayCanvas Self-Organizing Gaussians) -------------------------
+// Morton-ordered splats packed into lossless WebP textures inside a stored
+// (uncompressed) ZIP plus meta.json. Follows splat-transform's write-sog.ts.
+namespace {
+
+inline double sog_logt(double v) {  // sign(v) * log(|v| + 1), matches JS Math.sign
+    const double s = v > 0.0 ? 1.0 : (v < 0.0 ? -1.0 : 0.0);
+    return s * std::log(std::fabs(v) + 1.0);
+}
+
+// Optimal 1D quantization over pooled columns: 1024-bin histogram (uniform /
+// quantile blend), dynamic programming to k centroids, nearest-centroid labels.
+std::vector<float> sog_quantize_finite(const std::vector<float>& sorted, int kTarget,
+                                       double alpha) {
+    const int64_t N = (int64_t)sorted.size();
+    const int64_t H = std::min<int64_t>(1024, N);
+    const double vMin = sorted.front(), vMax = sorted.back();
+    const double vRange = vMax - vMin;
+    const double iqr = (double)sorted[(size_t)std::floor(N * 0.75)] -
+                       (double)sorted[(size_t)std::floor(N * 0.25)];
+    double beta = 1.0 - iqr / vRange;
+    beta = std::max(0.5, std::min(0.999, beta));
+    std::vector<double> counts((size_t)H, 0.0), sums((size_t)H, 0.0);
+    for (int64_t i = 0; i < N; ++i) {
+        const double v = sorted[(size_t)i];
+        int64_t bin = (int64_t)(H * (beta * ((double)i / (double)N) +
+                                     (1.0 - beta) * ((v - vMin) / vRange)));
+        if (bin > H - 1) bin = H - 1;
+        counts[(size_t)bin] += 1.0;
+        sums[(size_t)bin] += v;
+    }
+    std::vector<double> centers((size_t)H), weights((size_t)H);
+    for (int64_t i = 0; i < H; ++i) {
+        if (counts[(size_t)i] > 0.0) {
+            centers[(size_t)i] = sums[(size_t)i] / counts[(size_t)i];
+            weights[(size_t)i] = std::pow(counts[(size_t)i], alpha);
+        } else {
+            centers[(size_t)i] = vMin + (double)(i + 0.5) / (double)H * vRange;
+        }
+    }
+    std::vector<double> pW((size_t)H + 1, 0.0), pWX((size_t)H + 1, 0.0),
+        pWXX((size_t)H + 1, 0.0);
+    for (int64_t i = 0; i < H; ++i) {
+        pW[(size_t)i + 1] = pW[(size_t)i] + weights[(size_t)i];
+        pWX[(size_t)i + 1] = pWX[(size_t)i] + weights[(size_t)i] * centers[(size_t)i];
+        pWXX[(size_t)i + 1] = pWXX[(size_t)i] +
+                              weights[(size_t)i] * centers[(size_t)i] * centers[(size_t)i];
+    }
+    auto rangeCost = [&](int64_t a, int64_t b) {
+        const double w = pW[(size_t)b + 1] - pW[(size_t)a];
+        if (w <= 0.0) return 0.0;
+        const double wx = pWX[(size_t)b + 1] - pWX[(size_t)a];
+        const double wxx = pWXX[(size_t)b + 1] - pWXX[(size_t)a];
+        return wxx - wx * wx / w;
+    };
+    auto rangeMean = [&](int64_t a, int64_t b) {
+        const double w = pW[(size_t)b + 1] - pW[(size_t)a];
+        if (w <= 0.0) return (centers[(size_t)a] + centers[(size_t)b]) * 0.5;
+        return (pWX[(size_t)b + 1] - pWX[(size_t)a]) / w;
+    };
+    int64_t nonEmpty = 0;
+    for (double c : counts) if (c > 0.0) ++nonEmpty;
+    const int64_t eK = std::min<int64_t>(kTarget, nonEmpty);
+    const double INF = 1e30;
+    std::vector<double> dpP((size_t)H, INF), dpC((size_t)H, INF);
+    std::vector<std::vector<int32_t>> split((size_t)eK + 1);
+    split[1].assign((size_t)H, -1);
+    for (int64_t j = 0; j < H; ++j) dpP[(size_t)j] = rangeCost(0, j);
+    for (int64_t m = 2; m <= eK; ++m) {
+        std::fill(dpC.begin(), dpC.end(), INF);
+        split[(size_t)m].assign((size_t)H, 0);
+        for (int64_t j = m - 1; j < H; ++j) {
+            double best = INF;
+            int32_t bestS = (int32_t)(m - 2);
+            for (int64_t s = m - 2; s < j; ++s) {
+                const double c = dpP[(size_t)s] + rangeCost(s + 1, j);
+                if (c < best) { best = c; bestS = (int32_t)s; }
+            }
+            dpC[(size_t)j] = best;
+            split[(size_t)m][(size_t)j] = bestS;
+        }
+        dpP.swap(dpC);
+    }
+    std::vector<float> cv((size_t)eK);
+    int64_t j = H - 1;
+    for (int64_t m = eK; m >= 1; --m) {
+        const int64_t s = m > 1 ? split[(size_t)m][(size_t)j] : -1;
+        cv[(size_t)m - 1] = (float)rangeMean(s + 1, j);
+        j = s;
+    }
+    std::sort(cv.begin(), cv.end());
+    return cv;
+}
+
+struct SogQuant {
+    std::vector<float> centroids;               // k entries
+    std::vector<std::vector<uint8_t>> labels;  // [numCols][numRows]
+};
+
+SogQuant sog_quantize1d(const std::vector<const float*>& cols, int64_t nrows, int k = 256,
+                        double alpha = 0.5) {
+    SogQuant out;
+    const int64_t ncols = (int64_t)cols.size();
+    out.labels.assign((size_t)ncols, std::vector<uint8_t>((size_t)nrows, 0));
+    out.centroids.assign((size_t)k, 0.0f);
+    const int64_t N = nrows * ncols;
+    if (N == 0) return out;
+    std::vector<float> data((size_t)N);
+    for (int64_t c = 0; c < ncols; ++c)
+        std::copy(cols[(size_t)c], cols[(size_t)c] + nrows, data.begin() + (size_t)(c * nrows));
+    std::vector<float> finite;
+    finite.reserve((size_t)N);
+    bool hasNegInf = false, hasPosInf = false;
+    for (float v : data) {
+        if (std::isfinite(v)) finite.push_back(v);
+        else if (v == -std::numeric_limits<float>::infinity()) hasNegInf = true;
+        else if (v == std::numeric_limits<float>::infinity()) hasPosInf = true;
+    }
+    const int64_t nf = (int64_t)finite.size();
+    if (nf == 0 && !hasNegInf && !hasPosInf) {  // all NaN: pad with +20, labels to 255
+        std::fill(out.centroids.begin(), out.centroids.end(), 20.0f);
+        for (auto& l : out.labels) std::fill(l.begin(), l.end(), (uint8_t)255);
+        return out;
+    }
+    std::sort(finite.begin(), finite.end());
+    const int loSlots = hasNegInf ? 1 : 0, hiSlots = hasPosInf ? 1 : 0;
+    const float negInfC = (nf > 0 ? finite.front() : 0.0f) - 20.0f;
+    const float posInfC = (nf > 0 ? finite.back() : 0.0f) + 20.0f;
+    if (nf > 0) {
+        const double vMin = finite.front(), vMax = finite.back();
+        const bool flat = vMax - vMin < 1e-20;
+        if (loSlots == 0 && hiSlots == 0 && flat) {
+            std::fill(out.centroids.begin(), out.centroids.end(), (float)vMin);
+            return out;
+        }
+        std::vector<float> cvals;
+        if (flat) cvals.push_back((float)vMin);
+        else if (k - loSlots - hiSlots > 0)
+            cvals = sog_quantize_finite(finite, k - loSlots - hiSlots, alpha);
+        const size_t ek = cvals.size();
+        std::copy(cvals.begin(), cvals.end(), out.centroids.begin() + loSlots);
+        const float pad = ek > 0 ? cvals[ek - 1] : (hasNegInf ? negInfC : posInfC);
+        for (int i = loSlots + (int)ek; i < k - hiSlots; ++i) out.centroids[(size_t)i] = pad;
+    } else {
+        const float pad = hasNegInf ? negInfC : posInfC;
+        for (int i = loSlots; i < k - hiSlots; ++i) out.centroids[(size_t)i] = pad;
+    }
+    if (loSlots) out.centroids[0] = negInfC;
+    if (hiSlots) out.centroids[(size_t)k - 1] = posInfC;
+    const float* fc = out.centroids.data();
+    for (int64_t i = 0; i < N; ++i) {
+        const double v = data[(size_t)i];
+        int lo = 0, hi = k - 1;
+        while (lo < hi) {  // nearest centroid by midpoint binary search
+            const int mid = (lo + hi) >> 1;
+            if (v < ((double)fc[mid] + (double)fc[mid + 1]) * 0.5) hi = mid;
+            else lo = mid + 1;
+        }
+        out.labels[(size_t)(i / nrows)][(size_t)(i % nrows)] = (uint8_t)lo;
+    }
+    return out;
+}
+
+inline uint32_t sog_part1by2(uint32_t v) {
+    v &= 0x000003ffu;
+    v = (v ^ (v << 16)) & 0xff0000ffu;
+    v = (v ^ (v << 8)) & 0x0300f00fu;
+    v = (v ^ (v << 4)) & 0x030c30c3u;
+    v = (v ^ (v << 2)) & 0x09249249u;
+    return v;
+}
+
+// Recursively refined Morton (Z-order) sort over positions, 10 bits per axis.
+void sog_morton_gen(uint32_t* idx, size_t n, const float* p) {
+    if (n == 0) return;
+    double mnx = 1e300, mxx = -1e300, mny = 1e300, mxy = -1e300, mnz = 1e300,
+           mxz = -1e300;
+    for (size_t i = 0; i < n; ++i) {
+        const size_t b = (size_t)idx[i] * 3;
+        const double x = p[b], y = p[b + 1], z = p[b + 2];
+        if (x < mnx) mnx = x; if (x > mxx) mxx = x;
+        if (y < mny) mny = y; if (y > mxy) mxy = y;
+        if (z < mnz) mnz = z; if (z > mxz) mxz = z;
+    }
+    const double xlen = mxx - mnx, ylen = mxy - mny, zlen = mxz - mnz;
+    if (!std::isfinite(xlen) || !std::isfinite(ylen) || !std::isfinite(zlen)) return;
+    if (xlen == 0.0 && ylen == 0.0 && zlen == 0.0) return;
+    const double xmul = xlen == 0.0 ? 0.0 : 1024.0 / xlen;
+    const double ymul = ylen == 0.0 ? 0.0 : 1024.0 / ylen;
+    const double zmul = zlen == 0.0 ? 0.0 : 1024.0 / zlen;
+    std::vector<uint32_t> key(n);
+    for (size_t i = 0; i < n; ++i) {
+        const size_t b = (size_t)idx[i] * 3;
+        const uint32_t ix = (uint32_t)std::min(1023.0, ((double)p[b] - mnx) * xmul);
+        const uint32_t iy = (uint32_t)std::min(1023.0, ((double)p[b + 1] - mny) * ymul);
+        const uint32_t iz = (uint32_t)std::min(1023.0, ((double)p[b + 2] - mnz) * zmul);
+        key[i] = (sog_part1by2(iz) << 2) + (sog_part1by2(iy) << 1) + sog_part1by2(ix);
+    }
+    std::vector<uint32_t> sI(n), sK(n), counts(1024);
+    uint32_t *srcI = idx, *srcK = key.data(), *dstI = sI.data(), *dstK = sK.data();
+    for (int shift = 0; shift < 30; shift += 10) {  // 3-pass 10-bit radix sort
+        std::fill(counts.begin(), counts.end(), 0);
+        for (size_t i = 0; i < n; ++i) ++counts[(srcK[i] >> shift) & 1023];
+        uint32_t sum = 0;
+        for (int d = 0; d < 1024; ++d) {
+            const uint32_t c = counts[(size_t)d];
+            counts[(size_t)d] = sum;
+            sum += c;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const uint32_t o = counts[(srcK[i] >> shift) & 1023]++;
+            dstI[o] = srcI[i];
+            dstK[o] = srcK[i];
+        }
+        std::swap(srcI, dstI);
+        std::swap(srcK, dstK);
+    }
+    std::copy(sI.begin(), sI.end(), idx);
+    size_t start = 0;  // buckets sharing a code get re-sorted over local bounds
+    while (start < n) {
+        size_t end = start + 1;
+        while (end < n && sK[end] == sK[start]) ++end;
+        if (end - start > 256) sog_morton_gen(idx + start, end - start, p);
+        start = end;
+    }
+}
+
+// Exact nearest-centroid kd-tree for the SH palette k-means.
+struct SogKd {
+    struct Node { int dim = -1, left = -1, right = -1, pt = -1; float cut = 0.0f; };
+    int nc = 0;
+    const float* pts = nullptr;
+    std::vector<Node> nodes;
+    std::vector<int> ids;
+    void build(const float* p, int64_t k, int d) {
+        pts = p; nc = d; nodes.clear(); ids.resize((size_t)k);
+        for (int64_t i = 0; i < k; ++i) ids[(size_t)i] = (int)i;
+        if (k > 0) build_rec(0, k);
+    }
+    int build_rec(int64_t l, int64_t r) {
+        const int ni = (int)nodes.size();
+        nodes.emplace_back();
+        if (r - l == 1) { nodes[(size_t)ni].pt = ids[(size_t)l]; return ni; }
+        int bd = 0; double bs = -1.0;
+        for (int j = 0; j < nc; ++j) {
+            double mn = 1e300, mx = -1e300;
+            for (int64_t i = l; i < r; ++i) {
+                const double v = pts[(size_t)ids[(size_t)i] * (size_t)nc + j];
+                if (v < mn) mn = v; if (v > mx) mx = v;
+            }
+            if (mx - mn > bs) { bs = mx - mn; bd = j; }
+        }
+        const int64_t m = (l + r) / 2;
+        std::nth_element(ids.begin() + l, ids.begin() + m, ids.begin() + r,
+                         [&](int a, int b) {
+                             return pts[(size_t)a * (size_t)nc + bd] <
+                                    pts[(size_t)b * (size_t)nc + bd];
+                         });
+        nodes[(size_t)ni].dim = bd;
+        nodes[(size_t)ni].cut = pts[(size_t)ids[(size_t)m] * (size_t)nc + bd];
+        const int left = build_rec(l, m);
+        const int right = build_rec(m, r);
+        nodes[(size_t)ni].left = left;
+        nodes[(size_t)ni].right = right;
+        return ni;
+    }
+    int nearest(const float* q) const {
+        double best = 1e300; int bi = -1;
+        search(0, q, best, bi);
+        return bi;
+    }
+    void search(int ni, const float* q, double& best, int& bi) const {
+        const Node& nd = nodes[(size_t)ni];
+        if (nd.pt >= 0) {
+            double d2 = 0.0;
+            for (int j = 0; j < nc; ++j) {
+                const double d = (double)q[j] - (double)pts[(size_t)nd.pt * (size_t)nc + j];
+                d2 += d * d;
+            }
+            if (d2 < best) { best = d2; bi = nd.pt; }
+            return;
+        }
+        const double diff = (double)q[nd.dim] - (double)nd.cut;
+        const int f = diff <= 0.0 ? nd.left : nd.right;
+        const int s = diff <= 0.0 ? nd.right : nd.left;
+        search(f, q, best, bi);
+        if (diff * diff < best) search(s, q, best, bi);
+    }
+};
+
+struct SogKm { std::vector<float> centroids; std::vector<uint32_t> labels; };
+
+SogKm sog_kmeans_fit(const float* pts, int64_t n, int nc, int64_t k, int iters,
+                     std::mt19937& rng) {
+    SogKm r;
+    r.labels.assign((size_t)n, 0);
+    if (n < k) {  // fewer points than clusters: each point is its own centroid
+        r.centroids.assign(pts, pts + (size_t)n * (size_t)nc);
+        for (int64_t i = 0; i < n; ++i) r.labels[(size_t)i] = (uint32_t)i;
+        return r;
+    }
+    std::vector<int64_t> picks;  // Floyd's algorithm: k unique random indices
+    picks.reserve((size_t)k);
+    std::unordered_set<int64_t> seen;
+    for (int64_t j = n - k; j < n; ++j) {
+        std::uniform_int_distribution<int64_t> d(0, j);
+        const int64_t t = d(rng);
+        if (seen.insert(t).second) picks.push_back(t);
+        else { seen.insert(j); picks.push_back(j); }
+    }
+    r.centroids.assign((size_t)k * (size_t)nc, 0.0f);
+    for (int64_t i = 0; i < k; ++i)
+        std::copy(pts + picks[(size_t)i] * nc, pts + picks[(size_t)i] * nc + nc,
+                  r.centroids.begin() + (size_t)(i * nc));
+    std::vector<double> sums((size_t)k * (size_t)nc);
+    std::vector<int64_t> counts((size_t)k);
+    SogKd tree;
+    for (int it = 0; it < iters; ++it) {
+        tree.build(r.centroids.data(), k, nc);
+        for (int64_t i = 0; i < n; ++i)
+            r.labels[(size_t)i] = (uint32_t)tree.nearest(pts + i * nc);
+        std::fill(sums.begin(), sums.end(), 0.0);
+        std::fill(counts.begin(), counts.end(), 0);
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t c = r.labels[(size_t)i];
+            ++counts[(size_t)c];
+            for (int j = 0; j < nc; ++j)
+                sums[(size_t)c * (size_t)nc + j] += (double)pts[(size_t)i * (size_t)nc + j];
+        }
+        for (int64_t i = 0; i < k; ++i) {
+            if (counts[(size_t)i] == 0) {  // reseed empty clusters to a random point
+                std::uniform_int_distribution<int64_t> d(0, n - 1);
+                const int64_t src = d(rng);
+                std::copy(pts + src * nc, pts + src * nc + nc,
+                          r.centroids.begin() + (size_t)(i * nc));
+            } else {
+                const double inv = 1.0 / (double)counts[(size_t)i];
+                for (int j = 0; j < nc; ++j)
+                    r.centroids[(size_t)i * (size_t)nc + j] =
+                        (float)(sums[(size_t)i * (size_t)nc + j] * inv);
+            }
+        }
+    }
+    return r;
+}
+
+// Lloyd k-means with a fixed seed (deterministic exports). Large scenes fit the
+// palette on a stride subsample, then assign every splat to the nearest entry.
+SogKm sog_kmeans(const float* pts, int64_t n, int nc, int64_t k, int iters) {
+    std::mt19937 rng(0x51ab3u);
+    const int64_t S = std::min<int64_t>(n, 65536);
+    if (S == n) return sog_kmeans_fit(pts, n, nc, k, iters, rng);
+    std::vector<float> sub((size_t)S * (size_t)nc);
+    for (int64_t i = 0; i < S; ++i) {
+        const int64_t src = i * n / S;
+        std::copy(pts + src * nc, pts + src * nc + nc, sub.begin() + (size_t)(i * nc));
+    }
+    SogKm r = sog_kmeans_fit(sub.data(), S, nc, k, iters, rng);
+    const int64_t nk = (int64_t)r.centroids.size() / nc;
+    r.labels.assign((size_t)n, 0);
+    SogKd tree;
+    tree.build(r.centroids.data(), nk, nc);
+    for (int64_t i = 0; i < n; ++i)
+        r.labels[(size_t)i] = (uint32_t)tree.nearest(pts + i * nc);
+    return r;
+}
+
+// Lossless WebP via the full API with exact=1, so transparent pixels keep RGB.
+std::vector<uint8_t> sog_webp(const uint8_t* rgba, int w, int h) {
+    WebPConfig config;
+    if (!WebPConfigInit(&config) || !WebPConfigLosslessPreset(&config, 6))
+        throw std::runtime_error("WebPConfigLosslessPreset failed");
+    config.exact = 1;
+    if (!WebPValidateConfig(&config))
+        throw std::runtime_error("WebPValidateConfig failed");
+    WebPPicture pic;
+    if (!WebPPictureInit(&pic)) throw std::runtime_error("WebPPictureInit failed");
+    pic.width = w; pic.height = h;
+    pic.use_argb = 1;  // lossless RGB path; without this the encoder uses YUV
+    WebPMemoryWriter writer;
+    WebPMemoryWriterInit(&writer);
+    pic.writer = WebPMemoryWrite;
+    pic.custom_ptr = &writer;
+    int ok = WebPPictureImportRGBA(&pic, rgba, w * 4) && WebPEncode(&config, &pic);
+    WebPPictureFree(&pic);
+    if (!ok || !writer.mem) {
+        WebPMemoryWriterClear(&writer);
+        throw std::runtime_error("WebP lossless encode failed");
+    }
+    std::vector<uint8_t> r(writer.mem, writer.mem + writer.size);
+    WebPMemoryWriterClear(&writer);
+    return r;
+}
+
+inline void sog_zip_u16(std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back((uint8_t)x); v.push_back((uint8_t)(x >> 8));
+}
+inline void sog_zip_u32(std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back((uint8_t)x); v.push_back((uint8_t)(x >> 8));
+    v.push_back((uint8_t)(x >> 16)); v.push_back((uint8_t)(x >> 24));
+}
+
+// Stored (method 0) ZIP with data descriptors, like the reference writer.
+void sog_zip(const std::string& path,
+             const std::vector<std::pair<std::string, std::vector<uint8_t>>>& files) {
+    std::time_t now = std::time(nullptr);
+    std::tm tmv = *std::localtime(&now);
+    const uint16_t dosTime = (uint16_t)(((tmv.tm_hour) << 11) | ((tmv.tm_min) << 5) |
+                                       ((tmv.tm_sec / 2)));
+    const uint16_t dosDate = (uint16_t)(((tmv.tm_year - 80) << 9) | ((tmv.tm_mon + 1) << 5) |
+                                       (tmv.tm_mday));
+    struct Ent { std::string name; uint32_t crc, size, hdr; };
+    std::vector<Ent> ents;
+    std::vector<uint8_t> out;
+    for (const auto& f : files) {
+        if (out.size() >= 0xffffffffu)
+            throw std::runtime_error("SOG zip: file too large for 32-bit offsets");
+        const uint32_t hdr = (uint32_t)out.size();
+        const uint32_t crc = (uint32_t)mz_crc32(MZ_CRC32_INIT, f.second.data(), f.second.size());
+        const uint32_t sz = (uint32_t)f.second.size();
+        sog_zip_u32(out, 0x04034b50); sog_zip_u16(out, 20); sog_zip_u16(out, 0x0808);
+        sog_zip_u16(out, 0); sog_zip_u16(out, dosTime); sog_zip_u16(out, dosDate);
+        sog_zip_u32(out, 0); sog_zip_u32(out, 0); sog_zip_u32(out, 0);
+        sog_zip_u16(out, (uint32_t)f.first.size()); sog_zip_u16(out, 0);
+        out.insert(out.end(), f.first.begin(), f.first.end());
+        out.insert(out.end(), f.second.begin(), f.second.end());
+        sog_zip_u32(out, 0x08074b50); sog_zip_u32(out, crc);
+        sog_zip_u32(out, sz); sog_zip_u32(out, sz);
+        ents.push_back({f.first, crc, sz, hdr});
+    }
+    const uint32_t cdir = (uint32_t)out.size();
+    for (const auto& e : ents) {
+        sog_zip_u32(out, 0x02014b50); sog_zip_u16(out, 20); sog_zip_u16(out, 20);
+        sog_zip_u16(out, 0x0808); sog_zip_u16(out, 0);
+        sog_zip_u16(out, dosTime); sog_zip_u16(out, dosDate);
+        sog_zip_u32(out, e.crc); sog_zip_u32(out, e.size); sog_zip_u32(out, e.size);
+        sog_zip_u16(out, (uint32_t)e.name.size());
+        for (int i = 0; i < 4; ++i) sog_zip_u16(out, 0);  // extra/comment/disk/int attr
+        sog_zip_u32(out, 0); sog_zip_u32(out, e.hdr);
+        out.insert(out.end(), e.name.begin(), e.name.end());
+    }
+    const uint32_t cdirSize = (uint32_t)out.size() - cdir;
+    sog_zip_u32(out, 0x06054b50);
+    sog_zip_u16(out, 0); sog_zip_u16(out, 0);
+    sog_zip_u16(out, (uint32_t)ents.size()); sog_zip_u16(out, (uint32_t)ents.size());
+    sog_zip_u32(out, cdirSize); sog_zip_u32(out, cdir); sog_zip_u16(out, 0);
+    write_file_bytes(path, out);
+}
+
+}  // namespace
+
+void write_splat_sog(const SplatExportSource& s, const std::string& path,
+                     std::vector<uint32_t>* out_order) {
+    check_source(s, "write_splat_sog");
+    const int64_t n = s.num;
+    const int bands = s.sh_degree;
+    const int restCount = bands == 0 ? 0 : bands == 1 ? 9 : bands == 2 ? 24 : 45;
+    const int shCoeffs = bands == 0 ? 0 : bands == 1 ? 3 : bands == 2 ? 8 : 15;
+
+    std::vector<float> pos((size_t)n * 3);
+    for (int64_t k = 0; k < n; ++k) {
+        const int64_t row = src_row(s, k);
+        pos[(size_t)k * 3 + 0] = s.means[row * 3 + 0];
+        pos[(size_t)k * 3 + 1] = s.means[row * 3 + 1];
+        pos[(size_t)k * 3 + 2] = s.means[row * 3 + 2];
+    }
+    std::vector<uint32_t> order((size_t)n);
+    for (int64_t k = 0; k < n; ++k) order[(size_t)k] = (uint32_t)k;
+    sog_morton_gen(order.data(), (size_t)n, pos.data());
+    if (out_order) *out_order = order;
+
+    const int64_t W = (int64_t)std::ceil(std::sqrt((double)n) / 4.0) * 4;
+    const int64_t H = (int64_t)std::ceil((double)n / (double)W / 4.0) * 4;
+    if (W > 16383 || H > 16383)
+        throw std::runtime_error("SOG export: texture dimensions exceed 16383 texels");
+    const size_t texels = (size_t)W * (size_t)H;
+    auto tex = [&]() { return std::vector<uint8_t>(texels * 4, 0); };
+
+    // means: log-encoded, split across means_l (low bytes) and means_u (high).
+    double lmn[3] = {1e300, 1e300, 1e300}, lmx[3] = {-1e300, -1e300, -1e300};
+    for (int64_t k = 0; k < n; ++k)
+        for (int j = 0; j < 3; ++j) {
+            const double lt = sog_logt(pos[(size_t)k * 3 + j]);
+            if (lt < lmn[j]) lmn[j] = lt;
+            if (lt > lmx[j]) lmx[j] = lt;
+        }
+    std::vector<uint8_t> meansL = tex(), meansU = tex();
+    for (int64_t t = 0; t < n; ++t) {
+        const int64_t g = order[(size_t)t];
+        for (int j = 0; j < 3; ++j) {
+            const double lt = sog_logt(pos[(size_t)g * 3 + j]);
+            double x = lmx[j] > lmn[j] ? 65535.0 * (lt - lmn[j]) / (lmx[j] - lmn[j]) : 0.0;
+            if (!(x >= 0.0)) x = 0.0;  // NaN from infinite input becomes 0
+            const uint32_t u = (uint32_t)x;
+            meansL[(size_t)t * 4 + j] = (uint8_t)(u & 0xff);
+            meansU[(size_t)t * 4 + j] = (uint8_t)((u >> 8) & 0xff);
+        }
+        meansL[(size_t)t * 4 + 3] = 255;
+        meansU[(size_t)t * 4 + 3] = 255;
+    }
+
+    // quats: smallest-three packing, alpha tags the removed component.
+    static const int qidx[4][3] = {{1, 2, 3}, {0, 2, 3}, {0, 1, 3}, {0, 1, 2}};
+    std::vector<uint8_t> quatsTex = tex();
+    for (int64_t t = 0; t < n; ++t) {
+        const int64_t row = src_row(s, order[(size_t)t]);
+        double q[4] = {(double)s.quats[row * 4 + 0], (double)s.quats[row * 4 + 1],
+                       (double)s.quats[row * 4 + 2], (double)s.quats[row * 4 + 3]};
+        double l = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+        if (!(l > 1e-12)) { q[0] = 1.0; q[1] = q[2] = q[3] = 0.0; l = 1.0; }
+        for (int i = 0; i < 4; ++i) q[i] /= l;
+        int mc = 0;
+        for (int i = 1; i < 4; ++i)
+            if (std::fabs(q[i]) > std::fabs(q[mc])) mc = i;
+        const double sgn = (q[mc] < 0.0 ? -1.0 : 1.0) * std::sqrt(2.0);
+        for (int i = 0; i < 4; ++i) q[i] *= sgn;
+        for (int c = 0; c < 3; ++c) {
+            double b = 255.0 * (q[qidx[mc][c]] * 0.5 + 0.5);
+            if (!(b >= 0.0)) b = 0.0; else if (b > 255.0) b = 255.0;
+            quatsTex[(size_t)t * 4 + c] = (uint8_t)b;
+        }
+        quatsTex[(size_t)t * 4 + 3] = (uint8_t)(252 + mc);
+    }
+
+    // scales + DC: pooled 1D codebooks, labels scattered in Morton order.
+    std::vector<float> sc0((size_t)n), sc1((size_t)n), sc2((size_t)n);
+    std::vector<float> dc0((size_t)n), dc1((size_t)n), dc2((size_t)n);
+    for (int64_t k = 0; k < n; ++k) {
+        const int64_t row = src_row(s, k);
+        sc0[(size_t)k] = s.scales[row * 3 + 0];
+        sc1[(size_t)k] = s.scales[row * 3 + 1];
+        sc2[(size_t)k] = s.scales[row * 3 + 2];
+        dc0[(size_t)k] = s.features_dc[row * 3 + 0];
+        dc1[(size_t)k] = s.features_dc[row * 3 + 1];
+        dc2[(size_t)k] = s.features_dc[row * 3 + 2];
+    }
+    const SogQuant sq = sog_quantize1d({sc0.data(), sc1.data(), sc2.data()}, n);
+    const SogQuant cq = sog_quantize1d({dc0.data(), dc1.data(), dc2.data()}, n);
+    std::vector<uint8_t> scalesTex = tex(), sh0Tex = tex();
+    for (int64_t t = 0; t < n; ++t) {
+        const int64_t g = order[(size_t)t];
+        const int64_t row = src_row(s, g);
+        scalesTex[(size_t)t * 4 + 0] = sq.labels[0][(size_t)g];
+        scalesTex[(size_t)t * 4 + 1] = sq.labels[1][(size_t)g];
+        scalesTex[(size_t)t * 4 + 2] = sq.labels[2][(size_t)g];
+        scalesTex[(size_t)t * 4 + 3] = 255;
+        sh0Tex[(size_t)t * 4 + 0] = cq.labels[0][(size_t)g];
+        sh0Tex[(size_t)t * 4 + 1] = cq.labels[1][(size_t)g];
+        sh0Tex[(size_t)t * 4 + 2] = cq.labels[2][(size_t)g];
+        const double op = 1.0 / (1.0 + std::exp(-(double)s.opacities[row]));
+        const double b = op * 255.0;
+        sh0Tex[(size_t)t * 4 + 3] = b >= 255.0 ? 255 : (b > 0.0 ? (uint8_t)b : 0);
+    }
+
+    std::vector<std::pair<std::string, std::vector<uint8_t>>> files;
+    files.emplace_back("means_l.webp", sog_webp(meansL.data(), (int)W, (int)H));
+    files.emplace_back("means_u.webp", sog_webp(meansU.data(), (int)W, (int)H));
+    files.emplace_back("quats.webp", sog_webp(quatsTex.data(), (int)W, (int)H));
+    files.emplace_back("scales.webp", sog_webp(scalesTex.data(), (int)W, (int)H));
+    files.emplace_back("sh0.webp", sog_webp(sh0Tex.data(), (int)W, (int)H));
+
+    JVal meta = JVal::Obj();
+    meta.set("version", JVal::Int(2));
+    JVal asset = JVal::Obj();
+    asset.set("generator", JVal::Str("spirula-studio"));
+    meta.set("asset", asset);
+    meta.set("count", JVal::Int(n));
+    JVal means = JVal::Obj(), mins = JVal::Arr(), maxs = JVal::Arr(), mfiles = JVal::Arr();
+    for (int j = 0; j < 3; ++j) { mins.push(JVal::Float(lmn[j])); maxs.push(JVal::Float(lmx[j])); }
+    mfiles.push(JVal::Str("means_l.webp")); mfiles.push(JVal::Str("means_u.webp"));
+    means.set("mins", mins); means.set("maxs", maxs); means.set("files", mfiles);
+    meta.set("means", means);
+    auto codebookObj = [&](const char* name, const std::vector<float>& cb,
+                           const std::vector<const char*>& fnames) {
+        JVal o = JVal::Obj(), cba = JVal::Arr(), fa = JVal::Arr();
+        for (float v : cb) cba.push(JVal::Float(v));
+        for (const char* f : fnames) fa.push(JVal::Str(f));
+        o.set("codebook", cba); o.set("files", fa);
+        meta.set(name, o);
+    };
+    codebookObj("scales", sq.centroids, {"scales.webp"});
+    JVal quats = JVal::Obj(), qfiles = JVal::Arr();
+    qfiles.push(JVal::Str("quats.webp")); quats.set("files", qfiles);
+    meta.set("quats", quats);
+    codebookObj("sh0", cq.centroids, {"sh0.webp"});
+
+    if (bands > 0) {  // higher SH: k-means palette + per-column codebook
+        const int64_t paletteSize =
+            (int64_t)(std::min(64.0, std::pow(2.0, std::floor(std::log2((double)n / 1024.0)))) *
+                      1024.0);
+        std::vector<float> rest((size_t)n * (size_t)restCount);
+        for (int64_t k = 0; k < n; ++k) {
+            const int64_t row = src_row(s, k);
+            // Channel-major f_rest to match the reference: [r0..rN, g0..gN, b0..bN].
+            for (int c = 0; c < restCount; ++c)
+                rest[(size_t)k * (size_t)restCount + c] =
+                    src_sh(s, row, c % shCoeffs, c / shCoeffs);
+        }
+        const SogKm km = sog_kmeans(rest.data(), n, restCount, paletteSize, 10);
+        const int64_t nc = (int64_t)km.centroids.size() / restCount;
+        std::vector<std::vector<float>> cbCols((size_t)restCount,
+                                               std::vector<float>((size_t)nc));
+        for (int64_t i = 0; i < nc; ++i)
+            for (int j = 0; j < restCount; ++j)
+                cbCols[(size_t)j][(size_t)i] =
+                    km.centroids[(size_t)i * (size_t)restCount + j];
+        std::vector<const float*> colPtrs((size_t)restCount);
+        for (int j = 0; j < restCount; ++j) colPtrs[(size_t)j] = cbCols[(size_t)j].data();
+        const SogQuant cbq = sog_quantize1d(colPtrs, nc);
+        const int64_t cw = 64LL * shCoeffs, chh = (nc + 63) / 64;
+        std::vector<uint8_t> cenTex((size_t)cw * (size_t)chh * 4, 0);
+        for (int64_t i = 0; i < nc; ++i)
+            for (int j = 0; j < shCoeffs; ++j) {
+                const size_t o = ((size_t)i * (size_t)shCoeffs + j) * 4;
+                cenTex[o + 0] = cbq.labels[(size_t)j][(size_t)i];
+                cenTex[o + 1] = cbq.labels[(size_t)shCoeffs + j][(size_t)i];
+                cenTex[o + 2] = cbq.labels[(size_t)shCoeffs * 2 + j][(size_t)i];
+                cenTex[o + 3] = 255;
+            }
+        std::vector<uint8_t> labTex = tex();
+        for (int64_t t = 0; t < n; ++t) {
+            const uint32_t lab = km.labels[(size_t)order[(size_t)t]];
+            labTex[(size_t)t * 4 + 0] = (uint8_t)(lab & 0xff);
+            labTex[(size_t)t * 4 + 1] = (uint8_t)((lab >> 8) & 0xff);
+            labTex[(size_t)t * 4 + 2] = 0;
+            labTex[(size_t)t * 4 + 3] = 255;
+        }
+        files.emplace_back("shN_centroids.webp",
+                           sog_webp(cenTex.data(), (int)cw, (int)chh));
+        files.emplace_back("shN_labels.webp", sog_webp(labTex.data(), (int)W, (int)H));
+        JVal shN = JVal::Obj(), cba = JVal::Arr(), fa = JVal::Arr();
+        for (float v : cbq.centroids) cba.push(JVal::Float(v));
+        fa.push(JVal::Str("shN_centroids.webp")); fa.push(JVal::Str("shN_labels.webp"));
+        shN.set("count", JVal::Int(paletteSize));
+        shN.set("bands", JVal::Int(bands));
+        shN.set("codebook", cba); shN.set("files", fa);
+        meta.set("shN", shN);
+    }
+
+    std::string metaJson;
+    json_write(meta, metaJson, -1);
+    files.emplace_back("meta.json",
+                       std::vector<uint8_t>(metaJson.begin(), metaJson.end()));
+    sog_zip(path, files);
 }
 
 // RAD v1 writer (flat, no level-of-detail tree). Matches the official Spark
