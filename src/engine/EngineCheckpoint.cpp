@@ -12,6 +12,7 @@
 #include "engine/EngineInternal.h"
 #include "engine/EngineState.h"
 
+#include "checkpoint/SplatExport.h"
 #include "core/CheckpointIO.h"
 #include "external/npy.hpp"
 #include <cmath>
@@ -349,6 +350,49 @@ void engine_save_checkpoint(
             if (rows_in_buf == ROWS_PER_FLUSH) flush();
         }
         flush();
+    }
+
+    // --- SPZ/RAD exports (non-fatal; PLY + state.tar are the checkpoint) ---
+    {
+        std::vector<int64_t> emap;
+        emap.reserve((size_t)kept);
+        for (int64_t i = 0; i < N; i++)
+            if (keep[(size_t)i]) emap.push_back(i);
+        int deg = 0;
+        if (K >= 15) deg = 3;
+        else if (K >= 8) deg = 2;
+        else if (K >= 3) deg = 1;
+        if (K > 15)
+            fprintf(stderr, "[checkpoint] truncating SH degree 4 to 3 for SPZ/RAD\n");
+        spirula::SplatExportSource xs;
+        xs.num = kept;
+        xs.sh_degree = deg;
+        xs.map = emap.data();
+        xs.means = reinterpret_cast<const float*>(h_means.data());
+        xs.quats = reinterpret_cast<const float*>(h_quats.data());
+        xs.scales = reinterpret_cast<const float*>(h_scales.data());
+        xs.opacities = h_opacities.data();
+        xs.features_dc = reinterpret_cast<const float*>(h_features_dc.data());
+        std::function<float(int64_t, int, int)> sh_fn;
+        if (K > 0) {
+            if (quant_sh_value) {
+                sh_fn = decode_sh;
+                xs.sh_decode = &sh_fn;
+            } else {
+                xs.features_sh =
+                    reinterpret_cast<const float*>(h_features_sh.data());
+            }
+        }
+        try {
+            spirula::write_splat_spz(xs, (out_root / "splat.spz").string());
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[checkpoint] SPZ export failed: %s\n", e.what());
+        }
+        try {
+            spirula::write_splat_rad(xs, (out_root / "splat.rad").string());
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[checkpoint] RAD export failed: %s\n", e.what());
+        }
     }
 
     // --- state.tar: metadata-driven resume payload (see file header) ---------
