@@ -1,18 +1,12 @@
 #pragma once
 
-// Extra splat exports, written next to the checkpoint's splat.ply:
-//   SPZ -- nianticlabs/spz v3 legacy gzip layout.
-//   SOG -- Self-Organizing Gaussians: requires a native lossless WebP
-//          encoder (not yet implemented); throws.
-//   RAD -- World Labs Spark .rad, flat (no level-of-detail tree).
-//
-// SPZ and RAD take raw (un-activated) values in the write_splat_ply
-// convention: log scales, logit opacities, (w,x,y,z) quats,
-// DC as (colour - 0.5) / C0. features_sh is [srcN, K, 3] coefficient-major
-// (RGB inner axis), K = (sh_degree+1)^2 - 1, null when sh_degree == 0.
-// sh_decode covers a quantized SH store when features_sh is null.
-// map is an optional export-order indirection: exported splat k reads source
-// row map[k]; null selects the identity order.
+// Extra splat exports next to the checkpoint's splat.ply: SPZ (nianticlabs/spz,
+// v3 gzip or v4 zstd), SOG (PlayCanvas self-organizing Gaussians v2, lossless
+// WebP in a stored ZIP), RAD (flat Spark).
+// Inputs use the write_splat_ply convention: log scales, logit opacities,
+// (w,x,y,z) quats, DC as (colour - 0.5) / C0. features_sh is [srcN, K, 3]
+// coefficient-major (RGB inner), K = (sh_degree+1)^2 - 1, null when degree 0.
+// sh_decode covers a quantized SH store; map[k] is the source row of splat k.
 
 #include <cstdint>
 #include <functional>
@@ -36,7 +30,10 @@ struct SplatExportSource {
 
 // Throws std::runtime_error naming the file on failure.
 void write_splat_spz(const SplatExportSource& s, const std::string& path);
-void write_splat_sog(const SplatExportSource& s, const std::string& path);
+void write_splat_spz_v4(const SplatExportSource& s, const std::string& path);
+// out_order optionally receives the Morton-order permutation (texel t <- src row).
+void write_splat_sog(const SplatExportSource& s, const std::string& path,
+                     std::vector<uint32_t>* out_order = nullptr);
 void write_splat_rad(const SplatExportSource& s, const std::string& path);
 
 }  // namespace spirula

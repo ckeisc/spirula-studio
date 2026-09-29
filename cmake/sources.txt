@@ -42,6 +42,11 @@ src/app/TrainerCore.cpp
 src/app/EvalMetrics.cpp
 src/external/*.cpp
 src/external/*.c
+# libwebp lossless encoder (+ sharp-YUV, needed at link time by webp_enc.c)
+src/external/libwebp/src/enc/*.c
+src/external/libwebp/src/dsp/*.c
+src/external/libwebp/src/utils/*.c
+src/external/libwebp/sharpyuv/*.c
 
 [portable]
 # The same list minus the CUDA kernels. Compiled as csrc_portable by the
@@ -58,3 +63,8 @@ src/app/TrainerCore.cpp
 src/app/EvalMetrics.cpp
 src/external/*.cpp
 src/external/*.c
+# libwebp lossless encoder (+ sharp-YUV, needed at link time by webp_enc.c)
+src/external/libwebp/src/enc/*.c
+src/external/libwebp/src/dsp/*.c
+src/external/libwebp/src/utils/*.c
+src/external/libwebp/sharpyuv/*.c
